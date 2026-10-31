@@ -1,0 +1,339 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">FlashMeasure</string>
+      <ProtectedString name="Source">if not plugin then return end
+
+local Selection = game:GetService("Selection")
+local RunService = game:GetService("RunService")
+local Ui = require(script.Ui)
+local Adapter = require(script.Adapter)
+local panel = Ui.new(plugin, "FlashMeasure", "Flash Measure", "Measure")
+panel.label("Measure part Size boxes in studs. Rotated parts are included in the world-axis bounds. Mesh surfaces, collision geometry and actual solid volume are not measured.")
+local rows, results = {}, {}
+local status
+local function clear()
+    results = {}
+    for _, row in ipairs(rows) do row.Visible = false end
+    if status then status.Text = "Options changed. Measure again." end
+end
+local expand = panel.cycle("Scope", { "Selection only", "Include descendants" }, clear)
+local decimals = panel.field("Decimal places (0-6)", "3")
+decimals:GetPropertyChangedSignal("Text"):Connect(clear)
+status = panel.label("Select parts, or select a Model and include descendants. Exactly two parts also show origin distance and box gaps.")
+panel.button("Measure selection", function()
+    clear()
+    if RunService:IsRunning() then status.Text = "Stop the play test first." return end
+    local ok, result = pcall(Adapter.measure, Selection:Get(), { expand = expand() == "Include descendants", decimals = tonumber(decimals.Text) })
+    if not ok then status.Text = tostring(result) return end
+    results = result.rows
+    local summary, labels = Adapter.format(result)
+    status.Text = summary .. "\nShowing up to 100 parts. Click a row to select it. Measure again after edits."
+    for index, text in ipairs(labels) do rows[index].Text = text rows[index].Visible = true end
+end)
+for index = 1, 100 do
+    local slot = index
+    local row = panel.button("", function()
+        local result = results[slot]
+        if result and result.target:IsDescendantOf(game) then
+            Selection:Set({ result.target })
+        else
+            status.Text = "That part was removed. Measure again."
+        end
+    end)
+    row.Size = UDim2.new(1, 0, 0, 86)
+    row.TextSize = 14
+    row.TextTruncate = Enum.TextTruncate.AtEnd
+    row.Visible = false
+    rows[index] = row
+end
+plugin.Unloading:Connect(function() panel.destroy() end)
+</ProtectedString>
+    </Properties>
+    <Item class="ModuleScript" referent="RBX1">
+      <Properties>
+        <string name="Name">Adapter</string>
+        <ProtectedString name="Source">local Rules = require(script.Parent.Rules)
+local Scope = require(script.Parent.Scope)
+local Adapter = {}
+
+function Adapter.measure(selection, options)
+    assert(type(options.decimals) == "number" and options.decimals % 1 == 0 and options.decimals &gt;= 0 and options.decimals &lt;= 6, "Decimal places must be from 0 to 6.")
+    local parts, scanned = Scope.collect(selection, options.expand, function(object)
+        return object:IsA("BasePart") and not object:IsA("Terrain") and object:IsDescendantOf(workspace)
+            and object:FindFirstAncestorWhichIsA("WorldRoot") == workspace
+    end)
+    local records = {}
+    for _, part in ipairs(parts) do
+        local frame, size = part.CFrame, part.Size
+        local corners = {}
+        for _, x in ipairs({ -1, 1 }) do
+            for _, y in ipairs({ -1, 1 }) do
+                for _, z in ipairs({ -1, 1 }) do
+                    table.insert(corners, frame:PointToWorldSpace(Vector3.new(x * size.X / 2, y * size.Y / 2, z * size.Z / 2)))
+                end
+            end
+        end
+        table.insert(records, { target = part, path = part:GetFullName(), origin = frame.Position, size = size, corners = corners })
+    end
+    local result = Rules.report(records)
+    result.scanned = scanned
+    result.decimals = options.decimals
+    return result
+end
+
+function Adapter.format(result)
+    local format = "%." .. tostring(result.decimals) .. "f"
+    local function number(value)
+        if math.abs(value) &lt; 0.5 * 10 ^ -result.decimals then value = 0 end
+        return string.format(format, value)
+    end
+    local function vector(value)
+        return number(value.X) .. ", " .. number(value.Y) .. ", " .. number(value.Z)
+    end
+    local summary = {
+        string.format("%d parts / %d objects scanned. Snapshot only; nothing was edited.", #result.rows, result.scanned),
+        "World-axis box size (studs): " .. vector(result.extent),
+        "World-axis box center: " .. vector(result.center),
+        "Summed Size-box volume (studs cubed): " .. number(result.summedBoxVolume),
+    }
+    if result.originDistance then
+        table.insert(summary, "Two-part CFrame-origin distance: " .. number(result.originDistance))
+        table.insert(summary, "World-box gaps X, Y, Z: " .. vector(result.gap))
+        table.insert(summary, "World-box gap length: " .. number(result.boxGap) .. " (not a surface-distance measurement)")
+    end
+    local labels = {}
+    for index, row in ipairs(result.rows) do
+        if index &gt; 100 then break end
+        labels[index] = row.path .. "\nLocal Size: " .. vector(row.size) .. "\nCFrame origin: " .. vector(row.origin)
+    end
+    return table.concat(summary, "\n"), labels
+end
+
+return Adapter
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX2">
+      <Properties>
+        <string name="Name">Rules</string>
+        <ProtectedString name="Source">local Rules = {}
+local axes = { "X", "Y", "Z" }
+
+local function coordinate(value)
+    return type(value) == "number" and value == value and math.abs(value) &lt;= 1000000
+end
+
+function Rules.bounds(corners)
+    assert(#corners == 8, "A part box needs eight corners.")
+    local minimum = { X = math.huge, Y = math.huge, Z = math.huge }
+    local maximum = { X = -math.huge, Y = -math.huge, Z = -math.huge }
+    for _, corner in ipairs(corners) do
+        for _, axis in ipairs(axes) do
+            local value = corner[axis]
+            assert(coordinate(value), "Box corners must be finite and within one million studs of the origin.")
+            minimum[axis] = math.min(minimum[axis], value)
+            maximum[axis] = math.max(maximum[axis], value)
+        end
+    end
+    return minimum, maximum
+end
+
+function Rules.report(records)
+    assert(#records &gt; 0 and #records &lt;= 1000, "Choose between 1 and 1000 eligible Workspace parts.")
+    local minimum = { X = math.huge, Y = math.huge, Z = math.huge }
+    local maximum = { X = -math.huge, Y = -math.huge, Z = -math.huge }
+    local rows, boxVolume = {}, 0
+    for _, record in ipairs(records) do
+        for _, axis in ipairs(axes) do
+            assert(coordinate(record.origin[axis]), "Part origins must be finite and within one million studs.")
+            assert(coordinate(record.size[axis]) and record.size[axis] &gt; 0, "Part sizes must be positive, finite and at most one million studs per axis.")
+        end
+        local low, high = Rules.bounds(record.corners)
+        local volume = record.size.X * record.size.Y * record.size.Z
+        boxVolume += volume
+        table.insert(rows, { target = record.target, path = record.path, origin = record.origin, size = record.size, minimum = low, maximum = high, boxVolume = volume })
+        for _, axis in ipairs(axes) do
+            minimum[axis] = math.min(minimum[axis], low[axis])
+            maximum[axis] = math.max(maximum[axis], high[axis])
+        end
+    end
+    local extent, center = {}, {}
+    for _, axis in ipairs(axes) do
+        extent[axis] = maximum[axis] - minimum[axis]
+        center[axis] = (maximum[axis] + minimum[axis]) / 2
+    end
+    local result = { rows = rows, minimum = minimum, maximum = maximum, extent = extent, center = center, summedBoxVolume = boxVolume }
+    if #rows == 2 then
+        local squaredDistance, squaredGap = 0, 0
+        local gap = {}
+        for _, axis in ipairs(axes) do
+            squaredDistance += (rows[1].origin[axis] - rows[2].origin[axis]) ^ 2
+            gap[axis] = math.max(0, rows[1].minimum[axis] - rows[2].maximum[axis], rows[2].minimum[axis] - rows[1].maximum[axis])
+            squaredGap += gap[axis] ^ 2
+        end
+        result.originDistance = math.sqrt(squaredDistance)
+        result.gap = gap
+        result.boxGap = math.sqrt(squaredGap)
+    end
+    return result
+end
+
+return Rules
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX3">
+      <Properties>
+        <string name="Name">Scope</string>
+        <ProtectedString name="Source">local Scope = {}
+
+function Scope.collect(roots, expand, predicate, limits)
+    limits = limits or { maxNodes = 5000, maxTargets = 1000, allowServices = false }
+    assert(#roots &gt; 0 and #roots &lt;= 500, "Choose between 1 and 500 selection roots.")
+    local queued, stack, targets = {}, {}, {}
+    local discovered = 0
+    local function enqueue(object)
+        if queued[object] then return end
+        discovered += 1
+        assert(discovered &lt;= limits.maxNodes, "Scope exceeds " .. limits.maxNodes .. " objects. Select a smaller area.")
+        queued[object] = true
+        table.insert(stack, object)
+    end
+    for index = #roots, 1, -1 do
+        local object = roots[index]
+        assert(object.Parent and object:IsDescendantOf(game), "Selection contains a detached object.")
+        assert(limits.allowServices or object.Parent ~= game, "Select objects inside a service, not the service itself.")
+        enqueue(object)
+    end
+    while #stack &gt; 0 do
+        local object = table.remove(stack)
+        if predicate(object) then
+            assert(#targets &lt; limits.maxTargets, "More than " .. limits.maxTargets .. " targets. Select a smaller area.")
+            table.insert(targets, object)
+        end
+        if expand then
+            local children = object:GetChildren()
+            for index = #children, 1, -1 do enqueue(children[index]) end
+        end
+    end
+    return targets, discovered
+end
+
+return Scope
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX4">
+      <Properties>
+        <string name="Name">Ui</string>
+        <ProtectedString name="Source">local Ui = {}
+
+function Ui.new(plugin, id, title, action)
+    local studio = settings().Studio
+    local colors = {}
+    local connections = {}
+    local toolbar = plugin:CreateToolbar(title)
+    local toggle = toolbar:CreateButton(id, title, "", action)
+    local widget = plugin:CreateDockWidgetPluginGuiAsync(id .. "_v1", DockWidgetPluginGuiInfo.new(
+        Enum.InitialDockState.Right, false, false, 380, 600, 280, 260
+    ))
+    widget.Title = title
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.fromScale(1, 1)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 6
+    scroll.CanvasSize = UDim2.new()
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.Parent = widget
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 14)
+    padding.PaddingBottom = UDim.new(0, 14)
+    padding.PaddingLeft = UDim.new(0, 14)
+    padding.PaddingRight = UDim.new(0, 20)
+    padding.Parent = scroll
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 9)
+    layout.Parent = scroll
+    local order = 0
+    local function theme(object, property, color)
+        table.insert(colors, { object, property, color })
+        object[property] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[color])
+    end
+    theme(scroll, "BackgroundColor3", "MainBackground")
+    theme(scroll, "ScrollBarImageColor3", "MainText")
+    local function add(class, text)
+        order = order + 1
+        local object = Instance.new(class)
+        object.LayoutOrder = order
+        object.Size = UDim2.new(1, 0, 0, 32)
+        object.BorderSizePixel = 0
+        object.Font = Enum.Font.SourceSans
+        object.TextSize = 16
+        object.Text = text
+        object.TextWrapped = true
+        object.Parent = scroll
+        theme(object, "TextColor3", "MainText")
+        return object
+    end
+    local panel = { widget = widget }
+    function panel.label(text)
+        local object = add("TextLabel", text)
+        object.Size = UDim2.new(1, 0, 0, 0)
+        object.AutomaticSize = Enum.AutomaticSize.Y
+        object.BackgroundTransparency = 1
+        object.TextXAlignment = Enum.TextXAlignment.Left
+        return object
+    end
+    function panel.field(caption, initial)
+        panel.label(caption)
+        local object = add("TextBox", initial)
+        object.ClearTextOnFocus = false
+        object.TextWrapped = false
+        theme(object, "BackgroundColor3", "InputFieldBackground")
+        return object
+    end
+    function panel.button(text, callback)
+        local object = add("TextButton", text)
+        theme(object, "BackgroundColor3", "Button")
+        table.insert(connections, object.Activated:Connect(callback))
+        return object
+    end
+    function panel.cycle(caption, choices, changed)
+        local index = 1
+        local button
+        button = panel.button(caption .. ": " .. choices[index], function()
+            index = index % #choices + 1
+            button.Text = caption .. ": " .. choices[index]
+            changed()
+        end)
+        return function() return choices[index] end
+    end
+    panel.label(title)
+    table.insert(connections, toggle.Click:Connect(function() widget.Enabled = not widget.Enabled end))
+    table.insert(connections, widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+        toggle:SetActive(widget.Enabled)
+    end))
+    table.insert(connections, studio.ThemeChanged:Connect(function()
+        for _, item in ipairs(colors) do
+            item[1][item[2]] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[item[3]])
+        end
+    end))
+    toggle:SetActive(widget.Enabled)
+    function panel.destroy()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        widget:Destroy()
+        toolbar:Destroy()
+    end
+    return panel
+end
+
+return Ui
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
